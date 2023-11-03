@@ -1,0 +1,53 @@
+From 1c2d05ef5e6417c26641f82c2d7ad43632ee237f Mon Sep 17 00:00:00 2001
+From: Henri Verbeet <hverbeet@codeweavers.com>
+Date: Fri, 28 Jun 2019 14:27:10 +1000
+Subject: [PATCH] wined3d: Dont set DDSCAPS_FLIP for gdi renderer
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=47419
+---
+ dlls/wined3d/adapter_gl.c | 1 +
+ dlls/wined3d/adapter_vk.c | 1 +
+ dlls/wined3d/directx.c    | 3 +--
+ 3 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/wined3d/adapter_gl.c b/dlls/wined3d/adapter_gl.c
+index 991997af849..200edf9960c 100644
+--- a/dlls/wined3d/adapter_gl.c
++++ b/dlls/wined3d/adapter_gl.c
+@@ -4399,6 +4399,7 @@ static void adapter_gl_get_wined3d_caps(const struct wined3d_adapter *adapter, s
+     const struct wined3d_gl_info *gl_info = &adapter->gl_info;
+ 
+     caps->ddraw_caps.dds_caps |= WINEDDSCAPS_BACKBUFFER
++            | WINEDDSCAPS_FLIP
+             | WINEDDSCAPS_COMPLEX
+             | WINEDDSCAPS_FRONTBUFFER
+             | WINEDDSCAPS_3DDEVICE
+diff --git a/dlls/wined3d/adapter_vk.c b/dlls/wined3d/adapter_vk.c
+index c3a1832e353..b02d1c84690 100644
+--- a/dlls/wined3d/adapter_vk.c
++++ b/dlls/wined3d/adapter_vk.c
+@@ -298,6 +298,7 @@ static void adapter_vk_get_wined3d_caps(const struct wined3d_adapter *adapter, s
+     BOOL sampler_anisotropy = limits->maxSamplerAnisotropy > 1.0f;
+ 
+     caps->ddraw_caps.dds_caps |= WINEDDSCAPS_BACKBUFFER
++            | WINEDDSCAPS_FLIP
+             | WINEDDSCAPS_COMPLEX
+             | WINEDDSCAPS_FRONTBUFFER
+             | WINEDDSCAPS_3DDEVICE
+diff --git a/dlls/wined3d/directx.c b/dlls/wined3d/directx.c
+index 4cae64a20e6..6a26fc2a0ae 100644
+--- a/dlls/wined3d/directx.c
++++ b/dlls/wined3d/directx.c
+@@ -2194,8 +2194,7 @@ HRESULT CDECL wined3d_get_device_caps(const struct wined3d *wined3d, unsigned in
+     caps->ddraw_caps.ssb_color_key_caps = ckey_caps;
+     caps->ddraw_caps.ssb_fx_caps = fx_caps;
+ 
+-    caps->ddraw_caps.dds_caps = WINEDDSCAPS_FLIP
+-            | WINEDDSCAPS_OFFSCREENPLAIN
++    caps->ddraw_caps.dds_caps = WINEDDSCAPS_OFFSCREENPLAIN
+             | WINEDDSCAPS_PALETTE
+             | WINEDDSCAPS_PRIMARYSURFACE
+             | WINEDDSCAPS_TEXTURE
+-- 
+2.17.1
+

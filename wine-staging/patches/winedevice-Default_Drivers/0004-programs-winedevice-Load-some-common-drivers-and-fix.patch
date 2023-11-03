@@ -1,0 +1,141 @@
+From 024ec37f4c46f08e09b38d05ff9d4ebd5e9346e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Thu, 8 Jun 2017 23:50:03 +0200
+Subject: [PATCH] programs/winedevice: Load some common drivers and fix ldr
+ order.
+
+---
+ dlls/ntoskrnl.exe/tests/driver.c | 50 ++++++++++++++++++++++++++++++++
+ programs/winedevice/device.c     | 26 +++++++++++++++++
+ 2 files changed, 76 insertions(+)
+
+diff --git a/dlls/ntoskrnl.exe/tests/driver.c b/dlls/ntoskrnl.exe/tests/driver.c
+index 0506011ce56..9b42605a2a9 100644
+--- a/dlls/ntoskrnl.exe/tests/driver.c
++++ b/dlls/ntoskrnl.exe/tests/driver.c
+@@ -44,6 +44,7 @@ static const WCHAR driver_link[] = {'\\','D','o','s','D','e','v','i','c','e','s'
+ 
+ static DRIVER_OBJECT *driver_obj;
+ static DEVICE_OBJECT *lower_device, *upper_device;
++static LDR_MODULE *ldr_module;
+ 
+ static HANDLE okfile;
+ static LONG successes;
+@@ -1506,6 +1507,7 @@ static void test_resource(void)
+     ok(status == STATUS_SUCCESS, "got status %#x\n", status);
+ }
+ 
++
+ static void test_lookup_thread(void)
+ {
+     NTSTATUS status;
+@@ -1712,6 +1714,52 @@ static void test_executable_pool(void)
+ }
+ #endif
+ 
++static void test_default_modules(void)
++{
++    BOOL win32k = FALSE, dxgkrnl = FALSE, dxgmms1 = FALSE;
++    LIST_ENTRY *start, *entry;
++    ANSI_STRING name_a;
++    LDR_MODULE *mod;
++    NTSTATUS status;
++
++    /* Try to find start of the InLoadOrderModuleList list */
++    for (start = ldr_module->InLoadOrderModuleList.Flink; ; start = start->Flink)
++    {
++        mod = CONTAINING_RECORD(start, LDR_MODULE, InLoadOrderModuleList);
++
++        if (!MmIsAddressValid(&mod->BaseAddress) || !mod->BaseAddress) break;
++        if (!MmIsAddressValid(&mod->LoadCount) || !mod->LoadCount) break;
++        if (!MmIsAddressValid(&mod->SizeOfImage) || !mod->SizeOfImage) break;
++        if (!MmIsAddressValid(&mod->EntryPoint) || mod->EntryPoint < mod->BaseAddress ||
++            (DWORD_PTR)mod->EntryPoint > (DWORD_PTR)mod->BaseAddress + mod->SizeOfImage) break;
++    }
++
++    for (entry = start->Flink; entry != start; entry = entry->Flink)
++    {
++        mod = CONTAINING_RECORD(entry, LDR_MODULE, InLoadOrderModuleList);
++
++        status = RtlUnicodeStringToAnsiString(&name_a, &mod->BaseDllName, TRUE);
++        ok(!status, "RtlUnicodeStringToAnsiString failed with %08x\n", status);
++        if (status) continue;
++
++        if (entry == start->Flink)
++        {
++            ok(!strncmp(name_a.Buffer, "ntoskrnl.exe", name_a.Length),
++               "Expected ntoskrnl.exe, got %.*s\n", name_a.Length, name_a.Buffer);
++        }
++
++        if (!strncmp(name_a.Buffer, "win32k.sys", name_a.Length)) win32k = TRUE;
++        if (!strncmp(name_a.Buffer, "dxgkrnl.sys", name_a.Length)) dxgkrnl = TRUE;
++        if (!strncmp(name_a.Buffer, "dxgmms1.sys", name_a.Length)) dxgmms1 = TRUE;
++
++        RtlFreeAnsiString(&name_a);
++    }
++
++    ok(win32k, "Failed to find win32k.sys\n");
++    ok(dxgkrnl, "Failed to find dxgkrnl.sys\n");
++    ok(dxgmms1, "Failed to find dxgmms1.sys\n");
++}
++
+ static NTSTATUS main_test(DEVICE_OBJECT *device, IRP *irp, IO_STACK_LOCATION *stack)
+ {
+     ULONG length = stack->Parameters.DeviceIoControl.OutputBufferLength;
+@@ -1758,6 +1806,7 @@ static NTSTATUS main_test(DEVICE_OBJECT *device, IRP *irp, IO_STACK_LOCATION *st
+     test_stack_callout();
+     test_lookaside_list();
+     test_ob_reference(test_input->path);
++    test_default_modules();
+     test_resource();
+     test_lookup_thread();
+     test_IoAttachDeviceToDeviceStack();
+@@ -1981,6 +2030,7 @@ NTSTATUS WINAPI DriverEntry(DRIVER_OBJECT *driver, PUNICODE_STRING registry)
+     DbgPrint("loading driver\n");
+ 
+     driver_obj = driver;
++    ldr_module = (LDR_MODULE *)driver->DriverSection;
+ 
+     /* Allow unloading of the driver */
+     driver->DriverUnload = driver_Unload;
+diff --git a/programs/winedevice/device.c b/programs/winedevice/device.c
+index f4ebad2f2d0..b8ed745cb64 100644
+--- a/programs/winedevice/device.c
++++ b/programs/winedevice/device.c
+@@ -120,7 +120,33 @@ static DWORD WINAPI service_handler( DWORD ctrl, DWORD event_type, LPVOID event_
+ 
+ static void WINAPI ServiceMain( DWORD argc, LPWSTR *argv )
+ {
++    static const WCHAR ntoskrnlW[] = {'n','t','o','s','k','r','n','l','.','e','x','e',0};
++    static const WCHAR win32kW[]   = {'w','i','n','3','2','k','.','s','y','s',0};
++    static const WCHAR dxgkrnlW[]  = {'d','x','g','k','r','n','l','.','s','y','s',0};
++    static const WCHAR dxgmms1W[]  = {'d','x','g','m','m','s','1','.','s','y','s',0};
++    static const WCHAR *stubs[] = { win32kW, dxgkrnlW, dxgmms1W };
+     const WCHAR *service_group = (argc >= 2) ? argv[1] : argv[0];
++    LDR_MODULE *ldr;
++    ULONG_PTR magic;
++    int i;
++
++    /* Load some default drivers (required by anticheat drivers) */
++    for (i = 0; i < sizeof(stubs)/sizeof(stubs[0]); i++)
++    {
++        if (!LoadLibraryW( stubs[i] ))
++            ERR( "Failed to load %s\n", debugstr_w( stubs[i] ) );
++    }
++
++    /* ntoskrnl.exe must be the first module */
++    LdrLockLoaderLock( 0, NULL, &magic );
++    if (!LdrFindEntryForAddress( GetModuleHandleW( ntoskrnlW ), &ldr ))
++    {
++        RemoveEntryList( &ldr->InLoadOrderModuleList );
++        InsertHeadList( &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList, &ldr->InLoadOrderModuleList );
++        RemoveEntryList( &ldr->InMemoryOrderModuleList);
++        InsertHeadList( &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList, &ldr->InMemoryOrderModuleList );
++    }
++    LdrUnlockLoaderLock( 0, magic );
+ 
+     if (!(stop_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
+         return;
+-- 
+2.17.1
+

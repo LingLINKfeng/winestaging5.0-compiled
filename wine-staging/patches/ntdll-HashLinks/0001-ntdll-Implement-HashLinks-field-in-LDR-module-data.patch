@@ -1,0 +1,275 @@
+From 627cc81a90af23437264ec65017725911cc6b20f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Mon, 3 Apr 2017 05:30:27 +0200
+Subject: [PATCH] ntdll: Implement HashLinks field in LDR module data.
+
+---
+ dlls/kernel32/tests/loader.c | 76 ++++++++++++++++++++++++++++++++++++
+ dlls/ntdll/loader.c          | 65 ++++++++++++++++++++++++++++++
+ include/winternl.h           |  5 ++-
+ 3 files changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/kernel32/tests/loader.c b/dlls/kernel32/tests/loader.c
+index 3a507622070..4bc043e161d 100644
+--- a/dlls/kernel32/tests/loader.c
++++ b/dlls/kernel32/tests/loader.c
+@@ -30,6 +30,7 @@
+ #include "winbase.h"
+ #include "winternl.h"
+ #include "winnls.h"
++#include "winuser.h"
+ #include "wine/test.h"
+ #include "delayloadhandler.h"
+ 
+@@ -4047,6 +4048,79 @@ static void test_dll_file( const char *name )
+ #undef OK_FIELD
+ }
+ 
++static inline WCHAR toupperW(WCHAR c)
++{
++    WCHAR tmp = c;
++    CharUpperBuffW(&tmp, 1);
++    return tmp;
++}
++
++static ULONG hash_basename(const WCHAR *basename)
++{
++    WORD version = MAKEWORD(NtCurrentTeb()->Peb->OSMinorVersion,
++                            NtCurrentTeb()->Peb->OSMajorVersion);
++    ULONG hash = 0;
++
++    if (version >= 0x0602)
++    {
++        for (; *basename; basename++)
++            hash = hash * 65599 + toupperW(*basename);
++    }
++    else if (version == 0x0601)
++    {
++        for (; *basename; basename++)
++            hash = hash + 65599 * toupperW(*basename);
++    }
++    else
++        hash = toupperW(basename[0]) - 'A';
++
++    return hash & 31;
++}
++
++static void test_HashLinks(void)
++{
++    static WCHAR ntdllW[] = {'n','t','d','l','l','.','d','l','l',0};
++    static WCHAR kernel32W[] = {'k','e','r','n','e','l','3','2','.','d','l','l',0};
++
++    LIST_ENTRY *hash_map, *entry, *mark;
++    LDR_MODULE *module;
++    BOOL found;
++
++    entry = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    entry = entry->Flink;
++
++    module = CONTAINING_RECORD(entry, LDR_MODULE, InLoadOrderModuleList);
++    entry = module->HashLinks.Blink;
++
++    hash_map = entry - hash_basename(module->BaseDllName.Buffer);
++
++    mark = &hash_map[hash_basename(ntdllW)];
++    found = FALSE;
++    for (entry = mark->Flink; entry != mark; entry = entry->Flink)
++    {
++        module = CONTAINING_RECORD(entry, LDR_MODULE, HashLinks);
++        if (!lstrcmpiW(module->BaseDllName.Buffer, ntdllW))
++        {
++            found = TRUE;
++            break;
++        }
++    }
++    ok(found, "Could not find ntdll\n");
++
++    mark = &hash_map[hash_basename(kernel32W)];
++    found = FALSE;
++    for (entry = mark->Flink; entry != mark; entry = entry->Flink)
++    {
++        module = CONTAINING_RECORD(entry, LDR_MODULE, HashLinks);
++        if (!lstrcmpiW(module->BaseDllName.Buffer, kernel32W))
++        {
++            found = TRUE;
++            break;
++        }
++    }
++    ok(found, "Could not find kernel32\n");
++}
++
+ START_TEST(loader)
+ {
+     int argc;
+@@ -4118,10 +4192,12 @@ START_TEST(loader)
+     test_ExitProcess();
+     test_InMemoryOrderModuleList();
+     test_wow64_redirection();
++    test_HashLinks();
+     test_dll_file( "ntdll.dll" );
+     test_dll_file( "kernel32.dll" );
+     test_dll_file( "advapi32.dll" );
+     test_dll_file( "user32.dll" );
++
+     /* loader test must be last, it can corrupt the internal loader state on Windows */
+     test_Loader();
+ }
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index fc44dcfe3e5..4cf566d311e 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -121,6 +121,9 @@ static const char * const reason_names[] =
+ 
+ static const WCHAR dllW[] = {'.','d','l','l',0};
+ 
++#define HASH_MAP_SIZE 32
++static LIST_ENTRY hash_table[HASH_MAP_SIZE];
++
+ /* internal representation of 32bit modules. per process. */
+ typedef struct _wine_modref
+ {
+@@ -464,6 +467,52 @@ static void call_ldr_notifications( ULONG reason, LDR_MODULE *module )
+     }
+ }
+ 
++/*************************************************************************
++ *      hash_basename
++ *
++ * Calculates the bucket index of a dll using the basename.
++ */
++static ULONG hash_basename(const WCHAR *basename)
++{
++    WORD version = MAKEWORD(NtCurrentTeb()->Peb->OSMinorVersion,
++                            NtCurrentTeb()->Peb->OSMajorVersion);
++    ULONG hash = 0;
++
++    if (version >= 0x0602)
++    {
++        for (; *basename; basename++)
++            hash = hash * 65599 + toupperW(*basename);
++    }
++    else if (version == 0x0601)
++    {
++        for (; *basename; basename++)
++            hash = hash + 65599 * toupperW(*basename);
++    }
++    else
++        hash = toupperW(basename[0]) - 'A';
++
++    return hash & (HASH_MAP_SIZE-1);
++}
++
++/*************************************************************************
++ *      recompute_hash_maps
++ *
++ * Recomputes the LDR hash map (necessary when windows version changes).
++ */
++static void recompute_hash_map(void)
++{
++    PLIST_ENTRY mark, entry;
++    PLDR_MODULE mod;
++
++    mark = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
++    for (entry = mark->Flink; entry != mark; entry = entry->Flink)
++    {
++        mod = CONTAINING_RECORD(entry, LDR_MODULE, InLoadOrderModuleList);
++        RemoveEntryList( &mod->HashLinks );
++        InsertTailList( &hash_table[hash_basename(mod->BaseDllName.Buffer)], &mod->HashLinks );
++    }
++}
++
+ /*************************************************************************
+  *		get_modref
+  *
+@@ -1211,7 +1260,12 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
+                    &wm->ldr.InLoadOrderModuleList);
+     InsertTailList(&NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList,
+                    &wm->ldr.InMemoryOrderModuleList);
++    InsertTailList(&hash_table[hash_basename(wm->ldr.BaseDllName.Buffer)],
++                   &wm->ldr.HashLinks);
++
+     /* wait until init is called for inserting into InInitializationOrderModuleList */
++    wm->ldr.InInitializationOrderModuleList.Flink = NULL;
++    wm->ldr.InInitializationOrderModuleList.Blink = NULL;
+ 
+     if (!(nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT))
+     {
+@@ -1956,6 +2010,7 @@ static void load_builtin_callback( void *module, const char *filename )
+             /* the module has only be inserted in the load & memory order lists */
+             RemoveEntryList(&wm->ldr.InLoadOrderModuleList);
+             RemoveEntryList(&wm->ldr.InMemoryOrderModuleList);
++            RemoveEntryList(&wm->ldr.HashLinks);
+             /* FIXME: free the modref */
+             builtin_load_info->status = STATUS_DLL_NOT_FOUND;
+             return;
+@@ -2479,6 +2534,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
+             /* the module has only be inserted in the load & memory order lists */
+             RemoveEntryList(&wm->ldr.InLoadOrderModuleList);
+             RemoveEntryList(&wm->ldr.InMemoryOrderModuleList);
++            RemoveEntryList(&wm->ldr.HashLinks);
+ 
+             /* FIXME: there are several more dangling references
+              * left. Including dlls loaded by this dll before the
+@@ -3661,6 +3717,7 @@ static void free_modref( WINE_MODREF *wm )
+ {
+     RemoveEntryList(&wm->ldr.InLoadOrderModuleList);
+     RemoveEntryList(&wm->ldr.InMemoryOrderModuleList);
++    RemoveEntryList(&wm->ldr.HashLinks);
+     if (wm->ldr.InInitializationOrderModuleList.Flink)
+         RemoveEntryList(&wm->ldr.InInitializationOrderModuleList);
+ 
+@@ -4397,6 +4454,7 @@ void __wine_process_init(void)
+     SIZE_T info_size;
+     TEB *teb = thread_init();
+     PEB *peb = teb->Peb;
++    DWORD i;
+ 
+     /* setup the server connection */
+     server_init_process();
+@@ -4417,6 +4475,10 @@ void __wine_process_init(void)
+     load_global_options();
+     version_init();
+ 
++    /* initialize hash table */
++    for (i = 0; i < HASH_MAP_SIZE; i++)
++        InitializeListHead(&hash_table[i]);
++
+     /* setup the load callback and create ntdll modref */
+     wine_dll_set_callback( load_builtin_callback );
+ 
+@@ -4489,5 +4551,8 @@ void __wine_process_init(void)
+     teb->Tib.StackLimit = stack.StackLimit;
+     teb->DeallocationStack = stack.DeallocationStack;
+ 
++    /* the windows version was not set yet when ntdll and kernel32 were loaded */
++    recompute_hash_map();
++
+     server_init_process_done();
+ }
+diff --git a/include/winternl.h b/include/winternl.h
+index df1418477ad..2d7c86c389c 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -2242,8 +2242,8 @@ typedef struct _LDR_MODULE
+     ULONG               Flags;
+     SHORT               LoadCount;
+     SHORT               TlsIndex;
+-    HANDLE              SectionHandle;
+     ULONG               CheckSum;
++    LIST_ENTRY          HashLinks;
+     ULONG               TimeDateStamp;
+     HANDLE              ActivationContext;
+     PVOID               PatchInformation;
+@@ -2253,6 +2253,9 @@ typedef struct _LDR_MODULE
+     PVOID               ContextInformation;
+     ULONG_PTR           OriginalBase;
+     LARGE_INTEGER       LoadTime;
++
++    /* Not part of Win7 but used by Wine */
++    HANDLE              SectionHandle;
+ } LDR_MODULE, *PLDR_MODULE;
+ 
+ typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA
+-- 
+2.17.1
+

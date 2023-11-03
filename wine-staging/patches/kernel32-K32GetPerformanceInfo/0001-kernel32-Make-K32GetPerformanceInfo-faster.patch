@@ -1,0 +1,111 @@
+From 5cf696c2cb00fd040ddba99ac291806e5ce3c9bf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Sun, 19 Feb 2017 05:38:40 +0100
+Subject: [PATCH] kernel32: Make K32GetPerformanceInfo faster.
+
+---
+ dlls/kernel32/cpu.c | 32 ++++++++------------------------
+ server/process.c    | 18 ++++++++++++++++++
+ server/protocol.def |  8 ++++++++
+ 3 files changed, 34 insertions(+), 24 deletions(-)
+
+diff --git a/dlls/kernel32/cpu.c b/dlls/kernel32/cpu.c
+index 7668a10ea..96180bed4 100644
+--- a/dlls/kernel32/cpu.c
++++ b/dlls/kernel32/cpu.c
+@@ -211,7 +211,6 @@ BOOL WINAPI K32GetPerformanceInfo(PPERFORMANCE_INFORMATION info, DWORD size)
+ {
+     SYSTEM_PERFORMANCE_INFORMATION perf;
+     SYSTEM_BASIC_INFORMATION basic;
+-    SYSTEM_PROCESS_INFORMATION *process, *spi;
+     DWORD info_size;
+     NTSTATUS status;
+ 
+@@ -240,34 +239,19 @@ BOOL WINAPI K32GetPerformanceInfo(PPERFORMANCE_INFORMATION info, DWORD size)
+     info->KernelNonpaged     = perf.NonPagedPoolUsage;
+     info->PageSize           = basic.PageSize;
+ 
+-    /* fields from SYSTEM_PROCESS_INFORMATION */
+-    NtQuerySystemInformation( SystemProcessInformation, NULL, 0, &info_size );
+-    for (;;)
++    SERVER_START_REQ( get_system_info )
+     {
+-        process = HeapAlloc( GetProcessHeap(), 0, info_size );
+-        if (!process)
++        status = wine_server_call( req );
++        if (!status)
+         {
+-            SetLastError( ERROR_OUTOFMEMORY );
+-            return FALSE;
++            info->ProcessCount = reply->processes;
++            info->HandleCount = reply->handles;
++            info->ThreadCount = reply->threads;
+         }
+-        status = NtQuerySystemInformation( SystemProcessInformation, process, info_size, &info_size );
+-        if (!status) break;
+-        HeapFree( GetProcessHeap(), 0, process );
+-        if (status != STATUS_INFO_LENGTH_MISMATCH)
+-            goto err;
+     }
++    SERVER_END_REQ;
+ 
+-    info->HandleCount = info->ProcessCount = info->ThreadCount = 0;
+-    spi = process;
+-    for (;;)
+-    {
+-        info->ProcessCount++;
+-        info->HandleCount += spi->HandleCount;
+-        info->ThreadCount += spi->dwThreadCount;
+-        if (spi->NextEntryOffset == 0) break;
+-        spi = (SYSTEM_PROCESS_INFORMATION *)((char *)spi + spi->NextEntryOffset);
+-    }
+-    HeapFree( GetProcessHeap(), 0, process );
++    if (status) goto err;
+     return TRUE;
+ 
+ err:
+diff --git a/server/process.c b/server/process.c
+index beaa68603..2dacc4d5c 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -1799,3 +1799,21 @@ DECL_HANDLER(resume_process)
+         release_object( process );
+     }
+ }
++
++/* Retrieve process, thread and handle count */
++DECL_HANDLER(get_system_info)
++{
++    struct process *process;
++
++    reply->processes = 0;
++    reply->threads = 0;
++    reply->handles = 0;
++
++    LIST_FOR_EACH_ENTRY( process, &process_list, struct process, entry )
++    {
++        if (!process->running_threads) continue;
++        reply->processes++;
++        reply->threads += process->running_threads;
++        reply->handles += get_handle_table_count( process );
++    }
++}
+diff --git a/server/protocol.def b/server/protocol.def
+index e450388c1..1c1459f3c 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -3946,3 +3946,11 @@ struct handle_info
+ @REQ(resume_process)
+     obj_handle_t handle;       /* process handle */
+ @END
++
++/* Return system information values */
++@REQ(get_system_info)
++@REPLY
++    unsigned int processes;   /* number of processes */
++    unsigned int threads;     /* number of threads */
++    unsigned int handles;     /* number of handles */
++@END
+-- 
+2.21.0
+

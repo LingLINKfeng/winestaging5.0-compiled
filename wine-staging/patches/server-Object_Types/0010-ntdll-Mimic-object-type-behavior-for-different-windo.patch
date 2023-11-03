@@ -1,0 +1,181 @@
+From 963a3aedc5b1539187d9aa5065ff16d6c60b6477 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Wed, 8 Mar 2017 19:39:29 +0100
+Subject: [PATCH] ntdll: Mimic object type behavior for different windows
+ versions.
+
+---
+ dlls/ntdll/nt.c       | 17 +++++++++--
+ dlls/ntdll/om.c       |  5 +++-
+ dlls/ntdll/tests/om.c | 65 ++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/nt.c b/dlls/ntdll/nt.c
+index d194f863..452fad15 100644
+--- a/dlls/ntdll/nt.c
++++ b/dlls/ntdll/nt.c
+@@ -126,6 +126,19 @@ struct smbios_chassis {
+ #define FIRM 0x4649524D
+ #define RSMB 0x52534D42
+ 
++static DWORD translate_object_index(DWORD index)
++{
++    WORD version = MAKEWORD(NtCurrentTeb()->Peb->OSMinorVersion, NtCurrentTeb()->Peb->OSMajorVersion);
++
++    /* Process Hacker depends on this logic */
++    if (version >= 0x0602)
++        return index;
++    else if (version == 0x0601)
++        return index + 2;
++    else
++        return index + 1;
++}
++
+ /*
+  *	Token
+  */
+@@ -2617,7 +2630,7 @@ NTSTATUS WINAPI NtQuerySystemInformation(
+                         shi->Handle[i].OwnerPid     = info[i].owner;
+                         shi->Handle[i].HandleValue  = info[i].handle;
+                         shi->Handle[i].AccessMask   = info[i].access;
+-                        shi->Handle[i].ObjectType   = info[i].type;
++                        shi->Handle[i].ObjectType   = translate_object_index(info[i].type);
+                         /* FIXME: Fill out HandleFlags, ObjectPointer */
+                     }
+                 }
+@@ -2669,7 +2682,7 @@ NTSTATUS WINAPI NtQuerySystemInformation(
+                         shi->Handle[i].UniqueProcessId = info[i].owner;
+                         shi->Handle[i].HandleValue     = info[i].handle;
+                         shi->Handle[i].GrantedAccess   = info[i].access;
+-                        shi->Handle[i].ObjectTypeIndex = info[i].type;
++                        shi->Handle[i].ObjectTypeIndex = translate_object_index(info[i].type);
+                         /* FIXME: Fill out remaining fields */
+                     }
+                 }
+diff --git a/dlls/ntdll/om.c b/dlls/ntdll/om.c
+index c0479ea6..2156fad5 100644
+--- a/dlls/ntdll/om.c
++++ b/dlls/ntdll/om.c
+@@ -185,7 +185,10 @@ NTSTATUS WINAPI NtQueryObject(IN HANDLE handle,
+                     }
+                     if (status == STATUS_SUCCESS)
+                     {
+-                        p->TypeIndex = reply->index;
++                        WORD version = MAKEWORD(NtCurrentTeb()->Peb->OSMinorVersion,
++                                                NtCurrentTeb()->Peb->OSMajorVersion);
++                        if (version >= 0x0602)
++                            p->TypeIndex = reply->index;
+                     }
+                 }
+             }
+diff --git a/dlls/ntdll/tests/om.c b/dlls/ntdll/tests/om.c
+index a94b9866..54ef3955 100644
+--- a/dlls/ntdll/tests/om.c
++++ b/dlls/ntdll/tests/om.c
+@@ -74,6 +74,7 @@ static NTSTATUS (WINAPI *pNtQuerySystemTime)( LARGE_INTEGER * );
+ static NTSTATUS (WINAPI *pRtlWaitOnAddress)( const void *, const void *, SIZE_T, const LARGE_INTEGER * );
+ static void     (WINAPI *pRtlWakeAddressAll)( const void * );
+ static void     (WINAPI *pRtlWakeAddressSingle)( const void * );
++static NTSTATUS (WINAPI *pNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+ 
+ #define KEYEDEVENT_WAIT       0x0001
+ #define KEYEDEVENT_WAKE       0x0002
+@@ -1594,13 +1595,31 @@ static void test_query_object(void)
+ 
+ }
+ 
++static BOOL winver_equal_or_newer(WORD major, WORD minor)
++{
++    OSVERSIONINFOEXW info = {sizeof(info)};
++    ULONGLONG mask = 0;
++
++    info.dwMajorVersion = major;
++    info.dwMinorVersion = minor;
++
++    VER_SET_CONDITION(mask, VER_MAJORVERSION, VER_GREATER_EQUAL);
++    VER_SET_CONDITION(mask, VER_MINORVERSION, VER_GREATER_EQUAL);
++
++    return VerifyVersionInfoW(&info, VER_MAJORVERSION | VER_MINORVERSION, mask);
++}
++
+ static void test_query_object_types(void)
+ {
+     static const WCHAR typeW[] = {'T','y','p','e'};
++    static const WCHAR eventW[] = {'E','v','e','n','t'};
++    SYSTEM_HANDLE_INFORMATION_EX *shi;
+     OBJECT_TYPES_INFORMATION *buffer;
+     OBJECT_TYPE_INFORMATION *type;
+     NTSTATUS status;
+-    ULONG len, i;
++    HANDLE handle;
++    BOOL found;
++    ULONG len, i, event_type_index = 0;
+ 
+     buffer = HeapAlloc( GetProcessHeap(), 0, sizeof(OBJECT_TYPES_INFORMATION) );
+     ok( buffer != NULL, "Failed to allocate memory\n" );
+@@ -1628,11 +1647,54 @@ static void test_query_object_types(void)
+             ok( type->TypeName.Length == sizeof(typeW) && !strncmpW(typeW, type->TypeName.Buffer, 4),
+                 "Expected 'Type' as first type, got %s\n", wine_dbgstr_us(&type->TypeName) );
+         }
++        if (type->TypeName.Length == sizeof(eventW) && !strncmpW(eventW, type->TypeName.Buffer, 5))
++        {
++            if (winver_equal_or_newer( 6, 2 ))
++                event_type_index = type->TypeIndex;
++            else
++                event_type_index = winver_equal_or_newer( 6, 1 ) ? i + 2 : i + 1;
++        }
+ 
+         type = (OBJECT_TYPE_INFORMATION *)ROUND_UP( (DWORD_PTR)(type + 1) + length, sizeof(DWORD_PTR) );
+     }
+ 
+     HeapFree( GetProcessHeap(), 0, buffer );
++
++    ok( event_type_index, "Could not find object type for events\n" );
++
++    handle = CreateEventA( NULL, FALSE, FALSE, NULL );
++    ok( handle != NULL, "Failed to create event\n" );
++
++    shi = HeapAlloc( GetProcessHeap(), 0, sizeof(*shi) );
++    ok( shi != NULL, "Failed to allocate memory\n" );
++
++    status = pNtQuerySystemInformation( SystemExtendedHandleInformation, shi, sizeof(*shi), &len );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status );
++
++    shi = HeapReAlloc( GetProcessHeap(), 0, shi, len );
++    ok( shi != NULL, "Failed to allocate memory\n" );
++
++    status = pNtQuerySystemInformation( SystemExtendedHandleInformation, shi, len, &len );
++    ok( status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08x\n", status );
++
++    found = FALSE;
++    for (i = 0; i < shi->Count; i++)
++    {
++        if (shi->Handle[i].UniqueProcessId != GetCurrentProcessId())
++            continue;
++        if ((HANDLE)(ULONG_PTR)shi->Handle[i].HandleValue != handle)
++            continue;
++
++        ok( shi->Handle[i].ObjectTypeIndex == event_type_index, "Event type does not match: %u vs %u\n",
++            shi->Handle[i].ObjectTypeIndex, event_type_index );
++
++        found = TRUE;
++        break;
++    }
++    ok( found, "Expected to find event handle %p (pid %x) in handle list\n", handle, GetCurrentProcessId() );
++
++    HeapFree( GetProcessHeap(), 0, shi );
++    CloseHandle( handle );
+ }
+ 
+ static void test_type_mismatch(void)
+@@ -2226,6 +2288,7 @@ START_TEST(om)
+     pRtlWaitOnAddress       =  (void *)GetProcAddress(hntdll, "RtlWaitOnAddress");
+     pRtlWakeAddressAll      =  (void *)GetProcAddress(hntdll, "RtlWakeAddressAll");
+     pRtlWakeAddressSingle   =  (void *)GetProcAddress(hntdll, "RtlWakeAddressSingle");
++    pNtQuerySystemInformation = (void *)GetProcAddress(hntdll, "NtQuerySystemInformation");
+ 
+     test_case_sensitive();
+     test_namespace_pipe();
+-- 
+2.20.1
+

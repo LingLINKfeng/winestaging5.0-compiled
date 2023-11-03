@@ -1,0 +1,30 @@
+From 6ae64bdf13f10acc9a9fb4c4f7d06d1fb0c6b161 Mon Sep 17 00:00:00 2001
+From: Dmitry Timoshkov <dmitry@baikal.ru>
+Date: Fri, 16 Dec 2016 18:09:55 +0800
+Subject: [PATCH] gdiplus: Add support for more image color formats.
+
+---
+ dlls/gdiplus/image.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/gdiplus/image.c b/dlls/gdiplus/image.c
+index 8bd723f031..9601a57d67 100644
+--- a/dlls/gdiplus/image.c
++++ b/dlls/gdiplus/image.c
+@@ -61,8 +61,13 @@ static const struct
+     { &GUID_WICPixelFormat16bppBGR555, PixelFormat16bppRGB555, WICBitmapPaletteTypeFixedHalftone256 },
+     { &GUID_WICPixelFormat24bppBGR, PixelFormat24bppRGB, WICBitmapPaletteTypeFixedHalftone256 },
+     { &GUID_WICPixelFormat32bppBGR, PixelFormat32bppRGB, WICBitmapPaletteTypeFixedHalftone256 },
++    { &GUID_WICPixelFormat48bppRGB, PixelFormat48bppRGB, WICBitmapPaletteTypeFixedHalftone256 },
+     { &GUID_WICPixelFormat32bppBGRA, PixelFormat32bppARGB, WICBitmapPaletteTypeFixedHalftone256 },
+     { &GUID_WICPixelFormat32bppPBGRA, PixelFormat32bppPARGB, WICBitmapPaletteTypeFixedHalftone256 },
++    { &GUID_WICPixelFormat32bppCMYK, PixelFormat32bppCMYK, WICBitmapPaletteTypeFixedHalftone256 },
++    { &GUID_WICPixelFormat32bppGrayFloat, PixelFormat32bppARGB, WICBitmapPaletteTypeFixedGray256 },
++    { &GUID_WICPixelFormat64bppCMYK, PixelFormat48bppRGB, WICBitmapPaletteTypeFixedHalftone256 },
++    { &GUID_WICPixelFormat64bppRGBA, PixelFormat48bppRGB, WICBitmapPaletteTypeFixedHalftone256 },
+     { NULL }
+ };
+ 
+-- 
+2.19.1
+

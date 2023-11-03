@@ -1,0 +1,462 @@
+From 76abfa6c07701466a7a14bfeeaad64e357f54a1c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Thu, 7 Sep 2017 00:38:09 +0200
+Subject: [PATCH] tools/winebuild: Add syscall thunks for 64 bit.
+
+---
+ dlls/kernel32/tests/loader.c |   7 +-
+ dlls/ntdll/signal_x86_64.c   |   2 +
+ dlls/ntdll/thread.c          |  10 ++
+ libs/wine/loader.c           |   4 +
+ tools/winebuild/parser.c     |   2 +-
+ tools/winebuild/spec32.c     | 285 ++++++++++++++++++++++++++++++++++-
+ 6 files changed, 302 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/kernel32/tests/loader.c b/dlls/kernel32/tests/loader.c
+index 78fed489e9..47309b53ed 100644
+--- a/dlls/kernel32/tests/loader.c
++++ b/dlls/kernel32/tests/loader.c
+@@ -1536,7 +1536,7 @@ static void test_filenames(void)
+ 
+ static void test_FakeDLL(void)
+ {
+-#ifdef __i386__
++#if defined(__i386__) || defined(__x86_64__)
+     NTSTATUS (WINAPI *pNtSetEvent)(HANDLE, ULONG *) = NULL;
+     IMAGE_EXPORT_DIRECTORY *dir;
+     HMODULE module = GetModuleHandleA("ntdll.dll");
+@@ -1578,8 +1578,13 @@ static void test_FakeDLL(void)
+ 
+         dll_func = (BYTE *)GetProcAddress(module, func_name);
+         ok(dll_func != NULL, "%s: GetProcAddress returned NULL\n", func_name);
++#if defined(__i386__)
+         if (dll_func[0] == 0x90 && dll_func[1] == 0x90 &&
+             dll_func[2] == 0x90 && dll_func[3] == 0x90)
++#elif defined(__x86_64__)
++        if (dll_func[0] == 0x48 && dll_func[1] == 0x83 &&
++            dll_func[2] == 0xec && dll_func[3] == 0x08)
++#endif
+         {
+             todo_wine ok(0, "%s: Export is a stub-function, skipping\n", func_name);
+             continue;
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+index c372f65b34..e48529d73a 100644
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -355,6 +355,7 @@ static inline void set_sigcontext( const CONTEXT *context, ucontext_t *sigcontex
+ #endif
+ }
+ 
++extern void DECLSPEC_NORETURN __wine_syscall_dispatcher( void );
+ 
+ /***********************************************************************
+  * Definitions for Win32 unwind tables
+@@ -3133,6 +3134,7 @@ NTSTATUS signal_alloc_thread( TEB **teb )
+     {
+         (*teb)->Tib.Self = &(*teb)->Tib;
+         (*teb)->Tib.ExceptionList = (void *)~0UL;
++        (*teb)->WOW32Reserved = __wine_syscall_dispatcher;
+     }
+     return status;
+ }
+diff --git a/dlls/ntdll/thread.c b/dlls/ntdll/thread.c
+index ca01e0df8c..b939724704 100644
+--- a/dlls/ntdll/thread.c
++++ b/dlls/ntdll/thread.c
+@@ -63,6 +63,8 @@ struct _KUSER_SHARED_DATA *user_shared_data_external;
+ struct _KUSER_SHARED_DATA *user_shared_data = &user_shared_data_internal;
+ static const WCHAR default_windirW[] = {'C',':','\\','w','i','n','d','o','w','s',0};
+ 
++extern void DECLSPEC_NORETURN __wine_syscall_dispatcher( void );
++
+ void (WINAPI *kernel32_start_process)(LPTHREAD_START_ROUTINE,void*) = NULL;
+ 
+ /* info passed to a starting thread */
+@@ -326,6 +328,14 @@ TEB *thread_init(void)
+     InitializeListHead( &ldr.InInitializationOrderModuleList );
+     *(ULONG_PTR *)peb->Reserved = get_image_addr();
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++    *((DWORD*)((char*)user_shared_data_external + 0x1000)) = __wine_syscall_dispatcher;
++#endif
++    /* Pretend we don't support the SYSCALL instruction on x86-64. Needed for
++     * Chromium; see output_syscall_thunks_x64() in winebuild. */
++    user_shared_data->SystemCallPad[0] = 1;
++    user_shared_data_external->SystemCallPad[0] = 1;
++
+     /*
+      * Starting with Vista, the first user to log on has session id 1.
+      * Session id 0 is for processes that don't interact with the user (like services).
+diff --git a/libs/wine/loader.c b/libs/wine/loader.c
+index b6cac2ab92..682d18f8da 100644
+--- a/libs/wine/loader.c
++++ b/libs/wine/loader.c
+@@ -467,7 +467,11 @@ static void *map_dll( const IMAGE_NT_HEADERS *nt_descr )
+     sec->SizeOfRawData = code_end - code_start;
+     sec->Misc.VirtualSize = sec->SizeOfRawData;
+     sec->VirtualAddress   = code_start;
++#ifdef _WIN64
++    sec->PointerToRawData = 0x400; /* file alignment */
++#else
+     sec->PointerToRawData = 0x200; /* file alignment */
++#endif
+     sec->Characteristics  = (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+     sec++;
+ 
+diff --git a/tools/winebuild/parser.c b/tools/winebuild/parser.c
+index 004b6aea7a..40946409c5 100644
+--- a/tools/winebuild/parser.c
++++ b/tools/winebuild/parser.c
+@@ -545,7 +545,7 @@ static const char *parse_spec_flags( DLLSPEC *spec, ORDDEF *odp )
+ 
+ static int needs_syscall( ORDDEF *odp, DLLSPEC *spec )
+ {
+-    if (target_cpu != CPU_x86)
++    if (target_cpu != CPU_x86 && target_cpu != CPU_x86_64)
+         return 0;
+     if (odp->flags & (FLAG_FORWARD | FLAG_REGISTER))
+         return 0;
+diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
+index 800cb23023..19046e5a50 100644
+--- a/tools/winebuild/spec32.c
++++ b/tools/winebuild/spec32.c
+@@ -372,11 +372,11 @@ static void output_relay_debug( DLLSPEC *spec )
+ }
+ 
+ /*******************************************************************
+- *         output_syscall_thunks
++ *         output_syscall_thunks_x86
+  *
+  * Output entry points for system call functions
+  */
+-static void output_syscall_thunks( DLLSPEC *spec )
++static void output_syscall_thunks_x86( DLLSPEC *spec )
+ {
+     const unsigned int page_size = get_page_size();
+     int i;
+@@ -485,6 +485,157 @@ static void output_syscall_thunks( DLLSPEC *spec )
+     output_function_size( "__wine_syscall_dispatcher" );
+ }
+ 
++/*******************************************************************
++ *         output_syscall_thunks_x64
++ *
++ * Output entry points for system call functions
++ */
++static void output_syscall_thunks_x64( DLLSPEC *spec )
++{
++    const unsigned int page_size = get_page_size();
++    int i;
++
++    if (!spec->nb_syscalls)
++        return;
++
++    /* Reserve space for PE header directly before syscalls. */
++    if (target_platform == PLATFORM_APPLE)
++        output( "\t.text\n" );
++    else
++        output( "\n\t.section \".text.startup\"\n" );
++
++    output( "\t.align %d\n", get_alignment(65536) );
++    output( "__wine_spec_pe_header_syscalls:\n" );
++    output( "__wine_spec_pe_header_syscalls_end:\n" );
++    output( "\t.byte 0\n" );
++    output( "\t.balign %d, 0\n", page_size );
++
++    output( "\n/* syscall thunks */\n\n" );
++    for (i = 0; i < spec->nb_syscalls; i++)
++    {
++        ORDDEF *odp = spec->syscalls[i];
++        const char *name = odp->link_name;
++
++        /* Chromium depends on syscall thunks having the same form as on
++         * Windows. For 64-bit systems the only viable form we can emulate is
++         * having an int $0x2e fallback. Since actually using an interrupt is
++         * expensive, and since for some reason Chromium doesn't actually
++         * validate that instruction, we can just put a jmp there instead. */
++
++        output( "\t.balign 16, 0\n" );
++        output( "\t%s\n", func_declaration(name) );
++        output( "%s\n", asm_globl(name) );
++        output_cfi( ".cfi_startproc" );
++        output( "\t.byte 0x4c,0x8b,0xd1\n" );                               /* mov r10, rcx */
++        output( "\t.byte 0xb8\n" );                                         /* mov eax, SYSCALL */
++        output( "\t.long %d\n", i );
++        output( "\t.byte 0xf6,0x04,0x25,0x08,0x03,0xfe,0x7f,0x01\n" );      /* test byte ptr [0x7ffe0308], 1 */
++        output( "\t.byte 0x75,0x03\n" );                                    /* jne (over syscall) */
++        output( "\t.byte 0x0f,0x05\n" );                                    /* syscall */
++        output( "\t.byte 0xc3\n" );                                         /* ret */
++        output( "\t.byte 0xeb,0x01\n" );                                    /* jmp over ret */
++        output( "\t.byte 0xc3\n" );                                         /* ret */
++        if (target_platform == PLATFORM_APPLE)
++        {
++            output( "\t.byte 0xff,0x14,0x25\n" );                           /* call [0x7ffe1000] */
++            output( "\t.long 0x7ffe1000\n" );
++        }
++        else
++        {
++            output( "\t.byte 0x65,0xff,0x14,0x25\n" );                      /* call qword ptr gs:[0x100] */
++            output( "\t.long 0x100\n");
++        }
++        /* This RET is never reached, but Legends of Runeterra demands that it
++         * exist anyway. */
++        output( "\t.byte 0xc3\n" );                                         /* ret */
++        output_cfi( ".cfi_endproc" );
++        output_function_size( name );
++    }
++
++    for (i = 0; i < 0x20; i++)
++        output( "\t.byte 0\n" );
++
++    output( "\n/* syscall table */\n\n" );
++    output( "\t.data\n" );
++    output( "%s\n", asm_globl("__wine_syscall_table") );
++    for (i = 0; i < spec->nb_syscalls; i++)
++    {
++        ORDDEF *odp = spec->syscalls[i];
++        output ("\t%s %s\n", get_asm_ptr_keyword(), asm_name(odp->impl_name) );
++    }
++
++    output( "\n/* syscall argument stack size table */\n\n" );
++    output( "\t.data\n" );
++    output( "%s\n", asm_globl("__wine_syscall_stack_size") );
++    for (i = 0; i < spec->nb_syscalls; i++)
++    {
++        ORDDEF *odp = spec->syscalls[i];
++        output( "\t.byte %d\n", max(get_args_size(odp), 32) - 32 );
++    }
++
++    output( "\n/* syscall dispatcher */\n\n" );
++    output( "\t.text\n" );
++    output( "\t.align %d\n", get_alignment(16) );
++    output( "\t%s\n", func_declaration("__wine_syscall_dispatcher") );
++    output( "%s\n", asm_globl("__wine_syscall_dispatcher") );
++
++    /* prologue */
++    output_cfi( ".cfi_startproc" );
++    output( "\tpushq %%rbp\n" );
++    output_cfi( ".cfi_adjust_cfa_offset 8" );
++    output_cfi( ".cfi_rel_offset %%rbp,0" );
++    output( "\tmovq %%rsp,%%rbp\n" );
++    output_cfi( ".cfi_def_cfa_register %%rbp" );
++    output( "\tpushq %%rsi\n" );
++    output_cfi( ".cfi_rel_offset %%rsi,-8" );
++    output( "\tpushq %%rdi\n" );
++    output_cfi( ".cfi_rel_offset %%rdi,-16" );
++
++    /* Legends of Runeterra hooks the first system call return instruction, and
++     * depends on us returning to it. Adjust the return address accordingly. */
++    if (target_platform == PLATFORM_APPLE)
++        output( "\tsubq $0xb,0x8(%%rbp)\n" );
++    else
++        output( "\tsubq $0xc,0x8(%%rbp)\n" );
++
++    /* copy over any arguments on the stack */
++    output( "\tleaq 0x38(%%rbp),%%rsi\n" );
++    if (UsePIC)
++    {
++        output( "\tleaq (%%rip), %%r11\n" );
++        output( "1:\tmovzbq (%s-1b)(%%r11,%%rax,1),%%rcx\n", asm_name("__wine_syscall_stack_size") );
++    }
++    else
++        output( "\tmovzbq %s(%%rax),%%rcx\n", asm_name("__wine_syscall_stack_size") );
++    output( "\tsubq %%rcx,%%rsp\n" );
++    output( "\tand $~0xf,%%rsp\n\t" ); /* ensure stack alignment. */
++    output( "\tshrq $3,%%rcx\n" );
++    output( "\tmovq %%rsp,%%rdi\n" );
++    output( "\trep; movsq\n" );
++
++    /* call the function */
++    output( "\tmovq %%r10,%%rcx\n" );
++    output( "\tsubq $0x20,%%rsp\n" );
++    if (UsePIC)
++        output( "\tcallq *(%s-1b)(%%r11,%%rax,%d)\n", asm_name("__wine_syscall_table"), get_ptr_size() );
++    else
++        output( "\tcallq *%s(,%%rax,%d)\n", asm_name("__wine_syscall_table"), get_ptr_size() );
++    output( "\tleaq -0x10(%%rbp),%%rsp\n" );
++
++    /* epilogue */
++    output( "\tpopq %%rdi\n" );
++    output_cfi( ".cfi_same_value %%rdi" );
++    output( "\tpopq %%rsi\n" );
++    output_cfi( ".cfi_same_value %%rsi" );
++    output_cfi( ".cfi_def_cfa_register %%rsp" );
++    output( "\tpopq %%rbp\n" );
++    output_cfi( ".cfi_adjust_cfa_offset -8" );
++    output_cfi( ".cfi_same_value %%rbp" );
++    output( "\tret\n" );
++    output_cfi( ".cfi_endproc" );
++    output_function_size( "__wine_syscall_dispatcher" );
++}
++
+ /*******************************************************************
+  *         output_exports
+  *
+@@ -883,7 +1034,10 @@ void output_spec32_file( DLLSPEC *spec )
+     open_output_file();
+     output_standard_file_header();
+     output_module( spec );
+-    output_syscall_thunks( spec );
++    if (target_cpu == CPU_x86)
++        output_syscall_thunks_x86( spec );
++    else if (target_cpu == CPU_x86_64)
++        output_syscall_thunks_x64( spec );
+     output_stubs( spec );
+     output_exports( spec );
+     output_imports( spec );
+@@ -896,7 +1050,7 @@ void output_spec32_file( DLLSPEC *spec )
+ 
+ static int needs_stub_exports( DLLSPEC *spec )
+ {
+-    if (target_cpu != CPU_x86)
++    if (target_cpu != CPU_x86 && target_cpu != CPU_x86_64)
+         return 0;
+     if (!(spec->characteristics & IMAGE_FILE_DLL))
+         return 0;
+@@ -906,7 +1060,7 @@ static int needs_stub_exports( DLLSPEC *spec )
+ }
+ 
+ 
+-static void create_stub_exports_text( DLLSPEC *spec )
++static void create_stub_exports_text_x86( DLLSPEC *spec )
+ {
+     int i, nr_exports = spec->base <= spec->limit ? spec->limit - spec->base + 1 : 0;
+     size_t rva, thunk;
+@@ -1064,6 +1218,122 @@ static void create_stub_exports_text( DLLSPEC *spec )
+ }
+ 
+ 
++static void create_stub_exports_text_x64( DLLSPEC *spec )
++{
++    int i, nr_exports = spec->base <= spec->limit ? spec->limit - spec->base + 1 : 0;
++
++    /* output syscalls */
++    for (i = 0; i < spec->nb_syscalls; i++)
++    {
++        ORDDEF *odp = spec->syscalls[i];
++
++        align_output_rva( 16, 16 );
++        put_label( odp->link_name );
++        put_byte( 0x4c ); put_byte( 0x8b ); put_byte( 0xd1 );  /* mov r10, rcx */
++        put_byte( 0xb8 ); put_dword( i );                      /* mov eax, SYSCALL */
++        put_byte( 0xf6 ); put_byte( 0x04 ); put_byte( 0x25 );  /* test byte ptr [0x7ffe0308], 1 */
++                put_byte( 0x08 ); put_byte( 0x03 ); put_byte( 0xfe );
++                put_byte( 0x7f ); put_byte( 0x01 );
++        put_byte( 0x75 ); put_byte( 0x03 );                    /* jne */
++        put_byte( 0x0f ); put_byte( 0x05 );                    /* syscall */
++        put_byte( 0xc3 );                                      /* ret */
++        put_byte( 0xeb ); put_byte( 0x01 );                    /* jmp */
++        put_byte( 0xc3 );                                      /* ret */
++        if (target_platform == PLATFORM_APPLE)
++        {
++            put_byte( 0xff ); put_byte( 0x14 );                /* call [0x7ffe1000] */
++            put_byte( 0x25 ); put_dword( 0x7ffe1000 );
++        }
++        else
++        {
++            put_byte( 0x65 ); put_byte( 0xff );                /* call ptr gs:[0x100] */
++            put_byte( 0x14 ); put_byte( 0x25 ); put_dword( 0x100 );
++
++        }
++        put_byte( 0xc3 );                                      /* ret */
++    }
++
++    if (spec->nb_syscalls)
++    {
++        for (i = 0; i < 0x20; i++)
++            put_byte( 0 );
++    }
++
++    /* output stub code for exports */
++    for (i = 0; i < spec->nb_entry_points; i++)
++    {
++        ORDDEF *odp = &spec->entry_points[i];
++        const char *name;
++
++        if (odp->flags & FLAG_SYSCALL)
++            continue;
++
++        align_output_rva( 16, 16 );
++        name = get_stub_name( odp, spec );
++        put_label( name );
++        put_byte( 0xcc );                                             /* int $0x3 */
++        put_byte( 0xc3 );                                             /* ret */
++    }
++
++    /* output entry point */
++    align_output_rva( 16, 16 );
++    put_label( "entrypoint" );
++    put_byte( 0xb8 ); put_dword( 1 );                                 /* mov rax, 1 */
++    put_byte( 0xc3 );                                                 /* ret */
++
++    /* export directory */
++    align_output_rva( 16, 16 );
++    put_label( "export_start" );
++    put_dword( 0 );                             /* Characteristics */
++    put_dword( 0 );                             /* TimeDateStamp */
++    put_dword( 0 );                             /* MajorVersion/MinorVersion */
++    put_dword( label_rva("dll_name") );         /* Name */
++    put_dword( spec->base );                    /* Base */
++    put_dword( nr_exports );                    /* NumberOfFunctions */
++    put_dword( spec->nb_names );                /* NumberOfNames */
++    put_dword( label_rva("export_funcs") );     /* AddressOfFunctions */
++    put_dword( label_rva("export_names") );     /* AddressOfNames */
++    put_dword( label_rva("export_ordinals") );  /* AddressOfNameOrdinals */
++
++    put_label( "export_funcs" );
++    for (i = spec->base; i <= spec->limit; i++)
++    {
++        ORDDEF *odp = spec->ordinals[i];
++        if (odp)
++        {
++            const char *name = (odp->flags & FLAG_SYSCALL) ? odp->link_name : get_stub_name( odp, spec );
++            put_dword( label_rva( name ) );
++        }
++        else
++            put_dword( 0 );
++    }
++
++    if (spec->nb_names)
++    {
++        put_label( "export_names" );
++        for (i = 0; i < spec->nb_names; i++)
++            put_dword( label_rva(strmake("str_%s", get_stub_name(spec->names[i], spec))) );
++
++        put_label( "export_ordinals" );
++        for (i = 0; i < spec->nb_names; i++)
++            put_word( spec->names[i]->ordinal - spec->base );
++        if (spec->nb_names % 2)
++            put_word( 0 );
++    }
++
++    put_label( "dll_name" );
++    put_str( spec->file_name );
++
++    for (i = 0; i < spec->nb_names; i++)
++    {
++        put_label( strmake("str_%s", get_stub_name(spec->names[i], spec)) );
++        put_str( spec->names[i]->name );
++    }
++
++    put_label( "export_end" );
++}
++
++
+ static void create_stub_exports_data( DLLSPEC *spec )
+ {
+     int i;
+@@ -1263,7 +1533,10 @@ static void output_fake_module_pass( DLLSPEC *spec )
+     if (needs_stub_exports( spec ))
+     {
+         put_label( "text_start" );
+-        create_stub_exports_text( spec );
++        if (target_cpu == CPU_x86)
++            create_stub_exports_text_x86( spec );
++        else if (target_cpu == CPU_x86_64)
++            create_stub_exports_text_x64( spec );
+         put_label( "text_end" );
+     }
+     else
+-- 
+2.23.0
+

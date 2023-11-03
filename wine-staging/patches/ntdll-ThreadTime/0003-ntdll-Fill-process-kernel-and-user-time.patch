@@ -1,0 +1,162 @@
+From 06a283fc4f686ee3c3cf33fec4f7e7b2c3f64bc4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20M=C3=BCller?= <michael@fds-team.de>
+Date: Thu, 9 Mar 2017 16:27:23 +0100
+Subject: [PATCH] ntdll: Fill process kernel and user time.
+
+---
+ dlls/ntdll/nt.c         |  6 ++-
+ dlls/ntdll/ntdll_misc.h |  4 ++
+ dlls/ntdll/thread.c     | 84 +++++++++++++++++++++++------------------
+ 3 files changed, 57 insertions(+), 37 deletions(-)
+
+diff --git a/dlls/ntdll/nt.c b/dlls/ntdll/nt.c
+index 91d504f90aa..9c138726d68 100644
+--- a/dlls/ntdll/nt.c
++++ b/dlls/ntdll/nt.c
+@@ -2600,6 +2600,7 @@ NTSTATUS WINAPI NtQuerySystemInformation(
+         {
+             SYSTEM_PROCESS_INFORMATION* spi = SystemInformation;
+             SYSTEM_PROCESS_INFORMATION* last = NULL;
++            unsigned long clk_tck = sysconf(_SC_CLK_TCK);
+             HANDLE hSnap = 0;
+             WCHAR procname[1024];
+             WCHAR* exename;
+@@ -2637,7 +2638,7 @@ NTSTATUS WINAPI NtQuerySystemInformation(
+ 
+                         if (Length >= len + procstructlen)
+                         {
+-                            /* ftCreationTime, ftUserTime, ftKernelTime;
++                            /* ftCreationTime;
+                              * vmCounters, ioCounters
+                              */
+  
+@@ -2655,6 +2656,9 @@ NTSTATUS WINAPI NtQuerySystemInformation(
+ 
+                             /* spi->ti will be set later on */
+ 
++                            if (reply->unix_pid != -1)
++                                read_process_time(reply->unix_pid, -1, clk_tck,
++                                                  &spi->KernelTime, &spi->UserTime);
+                         }
+                         len += procstructlen;
+                     }
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index 70707bec042..db7f00359cf 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -270,6 +270,10 @@ extern SYSTEM_CPU_INFORMATION cpu_info DECLSPEC_HIDDEN;
+ NTSTATUS WINAPI RtlHashUnicodeString(PCUNICODE_STRING,BOOLEAN,ULONG,ULONG*);
+ void     WINAPI LdrInitializeThunk(CONTEXT*,void**,ULONG_PTR,ULONG_PTR);
+ 
++/* process / thread time */
++extern BOOL read_process_time(int unix_pid, int unix_tid, unsigned long clk_tck,
++                              LARGE_INTEGER *kernel, LARGE_INTEGER *user) DECLSPEC_HIDDEN;
++
+ /* string functions */
+ int __cdecl NTDLL_tolower( int c );
+ int __cdecl _stricmp( LPCSTR str1, LPCSTR str2 );
+diff --git a/dlls/ntdll/thread.c b/dlls/ntdll/thread.c
+index c6b70c557b4..029d94d8a38 100644
+--- a/dlls/ntdll/thread.c
++++ b/dlls/ntdll/thread.c
+@@ -153,6 +153,53 @@ static ULONG_PTR get_image_addr(void)
+ #endif
+ 
+ 
++
++BOOL read_process_time(int unix_pid, int unix_tid, unsigned long clk_tck,
++                       LARGE_INTEGER *kernel, LARGE_INTEGER *user)
++{
++#ifdef __linux__
++    unsigned long usr, sys;
++    char buf[512], *pos;
++    FILE *fp;
++    int i;
++
++    /* based on https://github.com/torvalds/linux/blob/master/fs/proc/array.c */
++    if (unix_tid != -1)
++        sprintf( buf, "/proc/%u/task/%u/stat", unix_pid, unix_tid );
++    else
++        sprintf( buf, "/proc/%u/stat", unix_pid );
++    if ((fp = fopen( buf, "r" )))
++    {
++        pos = fgets( buf, sizeof(buf), fp );
++        fclose( fp );
++
++        /* format of first chunk is "%d (%s) %c" - we have to skip to the last ')'
++         * to avoid misinterpreting the string. */
++        if (pos) pos = strrchr( pos, ')' );
++        if (pos) pos = strchr( pos + 1, ' ' );
++        if (pos) pos++;
++
++        /* skip over the following fields: state, ppid, pgid, sid, tty_nr, tty_pgrp,
++         * task->flags, min_flt, cmin_flt, maj_flt, cmaj_flt */
++        for (i = 0; (i < 11) && pos; i++)
++        {
++            pos = strchr( pos + 1, ' ' );
++            if (pos) pos++;
++        }
++
++        /* the next two values are user and system time */
++        if (pos && (sscanf( pos, "%lu %lu", &usr, &sys ) == 2))
++        {
++            kernel->QuadPart = (ULONGLONG)sys * 10000000 / clk_tck;
++            user->QuadPart   = (ULONGLONG)usr * 10000000 / clk_tck;
++            return TRUE;
++        }
++    }
++#endif
++    return FALSE;
++}
++
++
+ /***********************************************************************
+  *           set_process_name
+  *
+@@ -975,42 +1022,7 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+ #ifdef __linux__
+                 /* only /proc provides exact values for a specific thread */
+                 if (unix_pid != -1 && unix_tid != -1)
+-                {
+-                    unsigned long usr, sys;
+-                    char buf[512], *pos;
+-                    FILE *fp;
+-                    int i;
+-
+-                    /* based on https://github.com/torvalds/linux/blob/master/fs/proc/array.c */
+-                    sprintf( buf, "/proc/%u/task/%u/stat", unix_pid, unix_tid );
+-                    if ((fp = fopen( buf, "r" )))
+-                    {
+-                        pos = fgets( buf, sizeof(buf), fp );
+-                        fclose( fp );
+-
+-                        /* format of first chunk is "%d (%s) %c" - we have to skip to the last ')'
+-                         * to avoid misinterpreting the string. */
+-                        if (pos) pos = strrchr( pos, ')' );
+-                        if (pos) pos = strchr( pos + 1, ' ' );
+-                        if (pos) pos++;
+-
+-                        /* skip over the following fields: state, ppid, pgid, sid, tty_nr, tty_pgrp,
+-                         * task->flags, min_flt, cmin_flt, maj_flt, cmaj_flt */
+-                        for (i = 0; (i < 11) && pos; i++)
+-                        {
+-                            pos = strchr( pos + 1, ' ' );
+-                            if (pos) pos++;
+-                        }
+-
+-                        /* the next two values are user and system time */
+-                        if (pos && (sscanf( pos, "%lu %lu", &usr, &sys ) == 2))
+-                        {
+-                            kusrt.KernelTime.QuadPart = (ULONGLONG)sys * 10000000 / clk_tck;
+-                            kusrt.UserTime.QuadPart   = (ULONGLONG)usr * 10000000 / clk_tck;
+-                            filled_times = TRUE;
+-                        }
+-                    }
+-                }
++                    filled_times = read_process_time(unix_pid, unix_tid, clk_tck, &kusrt.KernelTime, &kusrt.UserTime);
+ #endif
+ 
+                 /* get values for current process instead */
+-- 
+2.23.0
+

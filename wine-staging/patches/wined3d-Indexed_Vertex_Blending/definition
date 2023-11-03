@@ -1,0 +1,2 @@
+Fixes: [39057] Support for Indexed Vertex Blending
+Depends: wined3d-SWVP-shaders
